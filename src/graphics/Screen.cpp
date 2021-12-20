@@ -1382,7 +1382,7 @@ void DebugInfo::drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *stat
 
     uint32_t rtc_sec = getValidTime(RTCQuality::RTCQualityFromNet);
     if (rtc_sec > 0) {
-        rtc_sec = rtc_sec - 18000;
+        rtc_sec = rtc_sec - 18000; //adjust gps time from UTC to EST
         long hms = rtc_sec % SEC_PER_DAY;
         // hms += tz.tz_dsttime * SEC_PER_HOUR;
         // hms -= tz.tz_minuteswest * SEC_PER_MIN;
