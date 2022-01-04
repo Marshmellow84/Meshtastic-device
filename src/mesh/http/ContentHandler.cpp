@@ -41,6 +41,13 @@ using namespace httpsserver;
 
 #include "mesh/http/ContentHandler.h"
 
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+HTTPClient http;
+
+#define DEST_FS_USES_SPIFFS
+#include <ESP32-targz.h>
+
 // We need to specify some content-type mapping, so the resources get delivered with the
 // right content type and are displayed correctly in the browser
 char contentTypes[][2][32] = {{".txt", "text/plain"},     {".html", "text/html"},
@@ -50,20 +57,57 @@ char contentTypes[][2][32] = {{".txt", "text/plain"},     {".html", "text/html"}
                               {".css", "text/css"},       {".ico", "image/vnd.microsoft.icon"},
                               {".svg", "image/svg+xml"},  {"", ""}};
 
+//const char *tarURL = "https://www.casler.org/temp/meshtastic-web.tar";
+const char *tarURL = "https://api-production-871d.up.railway.app/mirror/webui";
+const char *certificate = NULL; // change this as needed, leave as is for no TLS check (yolo security)
+
 // Our API to handle messages to and from the radio.
 HttpAPI webAPI;
 
-uint32_t numberOfRequests = 0;
-uint32_t timeSpeedUp = 0;
-
-uint32_t getTimeSpeedUp()
+WiFiClient *getTarHTTPClientPtr(WiFiClientSecure *client, const char *url, const char *cert = NULL)
 {
-    return timeSpeedUp;
-}
-
-void setTimeSpeedUp()
-{
-    timeSpeedUp = millis();
+    if (cert == NULL) {
+        // New versions don't have setInsecure
+        // client->setInsecure();
+    } else {
+        client->setCACert(cert);
+    }
+    const char *UserAgent = "ESP32-HTTP-GzUpdater-Client";
+    http.setReuse(true); // handle 301 redirects gracefully
+    http.setUserAgent(UserAgent);
+    http.setConnectTimeout(10000); // 10s timeout = 10000
+    if (!http.begin(*client, url)) {
+        log_e("Can't open url %s", url);
+        return nullptr;
+    }
+    const char *headerKeys[] = {"location", "redirect", "Content-Type", "Content-Length", "Content-Disposition"};
+    const size_t numberOfHeaders = 5;
+    http.collectHeaders(headerKeys, numberOfHeaders);
+    int httpCode = http.GET();
+    // file found at server
+    if (httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+        String newlocation = "";
+        String headerLocation = http.header("location");
+        String headerRedirect = http.header("redirect");
+        if (headerLocation != "") {
+            newlocation = headerLocation;
+            Serial.printf("302 (location): %s => %s\n", url, headerLocation.c_str());
+        } else if (headerRedirect != "") {
+            Serial.printf("301 (redirect): %s => %s\n", url, headerLocation.c_str());
+            newlocation = headerRedirect;
+        }
+        http.end();
+        if (newlocation != "") {
+            log_w("Found 302/301 location header: %s", newlocation.c_str());
+            return getTarHTTPClientPtr(client, newlocation.c_str(), cert);
+        } else {
+            log_e("Empty redirect !!");
+            return nullptr;
+        }
+    }
+    if (httpCode != 200)
+        return nullptr;
+    return http.getStreamPtr();
 }
 
 void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
@@ -79,6 +123,8 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     ResourceNode *nodeHotspotApple = new ResourceNode("/hotspot-detect.html", "GET", &handleHotspot);
     ResourceNode *nodeHotspotAndroid = new ResourceNode("/generate_204", "GET", &handleHotspot);
 
+    ResourceNode *nodeUpdateSPIFFS = new ResourceNode("/update", "GET", &handleUpdateSPIFFS);
+
     ResourceNode *nodeRestart = new ResourceNode("/restart", "POST", &handleRestart);
     ResourceNode *nodeFormUpload = new ResourceNode("/upload", "POST", &handleFormUpload);
 
@@ -87,7 +133,7 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     ResourceNode *nodeJsonReport = new ResourceNode("/json/report", "GET", &handleReport);
     ResourceNode *nodeJsonSpiffsBrowseStatic = new ResourceNode("/json/spiffs/browse/static", "GET", &handleSpiffsBrowseStatic);
     ResourceNode *nodeJsonDelete = new ResourceNode("/json/spiffs/delete/static", "DELETE", &handleSpiffsDeleteStatic);
-    
+
     ResourceNode *nodeRoot = new ResourceNode("/*", "GET", &handleStatic);
 
     // Secure nodes
@@ -103,9 +149,8 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     secureServer->registerNode(nodeJsonSpiffsBrowseStatic);
     secureServer->registerNode(nodeJsonDelete);
     secureServer->registerNode(nodeJsonReport);
-    secureServer->registerNode(nodeRoot);
-
-    secureServer->addMiddleware(&middlewareSpeedUp240);
+    secureServer->registerNode(nodeUpdateSPIFFS);
+    secureServer->registerNode(nodeRoot); // This has to be last
 
     // Insecure nodes
     insecureServer->registerNode(nodeAPIv1ToRadioOptions);
@@ -120,50 +165,14 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     insecureServer->registerNode(nodeJsonSpiffsBrowseStatic);
     insecureServer->registerNode(nodeJsonDelete);
     insecureServer->registerNode(nodeJsonReport);
-    insecureServer->registerNode(nodeRoot);
-
-    insecureServer->addMiddleware(&middlewareSpeedUp160);
-}
-
-void middlewareSpeedUp240(HTTPRequest *req, HTTPResponse *res, std::function<void()> next)
-{
-    // We want to print the response status, so we need to call next() first.
-    next();
-
-    // Phone (or other device) has contacted us over WiFi. Keep the radio turned on.
-    //   TODO: This should go into its own middleware layer separate from the speedup.
-    powerFSM.trigger(EVENT_CONTACT_FROM_PHONE);
-
-    setCpuFrequencyMhz(240);
-    setTimeSpeedUp();
-
-    numberOfRequests++;
-}
-
-void middlewareSpeedUp160(HTTPRequest *req, HTTPResponse *res, std::function<void()> next)
-{
-    // We want to print the response status, so we need to call next() first.
-    next();
-
-    // Phone (or other device) has contacted us over WiFi. Keep the radio turned on.
-    //   TODO: This should go into its own middleware layer separate from the speedup.
-    powerFSM.trigger(EVENT_CONTACT_FROM_PHONE);
-
-    // If the frequency is 240mhz, we have recently gotten a HTTPS request.
-    //   In that case, leave the frequency where it is and just update the
-    //   countdown timer (timeSpeedUp).
-    if (getCpuFrequencyMhz() != 240) {
-        setCpuFrequencyMhz(160);
-    }
-    setTimeSpeedUp();
-
-    numberOfRequests++;
+    insecureServer->registerNode(nodeUpdateSPIFFS);
+    insecureServer->registerNode(nodeRoot); // This has to be last
 }
 
 void handleAPIv1FromRadio(HTTPRequest *req, HTTPResponse *res)
 {
 
-    DEBUG_MSG("+++++++++++++++ webAPI handleAPIv1FromRadio\n");
+    DEBUG_MSG("webAPI handleAPIv1FromRadio\n");
 
     /*
         For documentation, see:
@@ -208,12 +217,12 @@ void handleAPIv1FromRadio(HTTPRequest *req, HTTPResponse *res)
         res->write(txBuf, len);
     }
 
-    DEBUG_MSG("--------------- webAPI handleAPIv1FromRadio, len %d\n", len);
+    DEBUG_MSG("webAPI handleAPIv1FromRadio, len %d\n", len);
 }
 
 void handleAPIv1ToRadio(HTTPRequest *req, HTTPResponse *res)
 {
-    DEBUG_MSG("+++++++++++++++ webAPI handleAPIv1ToRadio\n");
+    DEBUG_MSG("webAPI handleAPIv1ToRadio\n");
 
     /*
         For documentation, see:
@@ -226,7 +235,6 @@ void handleAPIv1ToRadio(HTTPRequest *req, HTTPResponse *res)
     res->setHeader("Access-Control-Allow-Origin", "*");
     res->setHeader("Access-Control-Allow-Methods", "PUT, OPTIONS");
     res->setHeader("X-Protobuf-Schema", "https://raw.githubusercontent.com/meshtastic/Meshtastic-protobufs/master/mesh.proto");
-
 
     if (req->getMethod() == "OPTIONS") {
         res->setStatusCode(204); // Success with no content
@@ -241,7 +249,7 @@ void handleAPIv1ToRadio(HTTPRequest *req, HTTPResponse *res)
     webAPI.handleToRadio(buffer, s);
 
     res->write(buffer, s);
-    DEBUG_MSG("--------------- webAPI handleAPIv1ToRadio\n");
+    DEBUG_MSG("webAPI handleAPIv1ToRadio\n");
 }
 
 void handleSpiffsBrowseStatic(HTTPRequest *req, HTTPResponse *res)
@@ -336,7 +344,6 @@ void handleStatic(HTTPRequest *req, HTTPResponse *res)
         std::string filename = "/static/" + parameter1;
         std::string filenameGzip = "/static/" + parameter1 + ".gz";
 
-
         // Try to open the file from SPIFFS
         File file;
 
@@ -351,14 +358,21 @@ void handleStatic(HTTPRequest *req, HTTPResponse *res)
             file = SPIFFS.open(filenameGzip.c_str());
             res->setHeader("Content-Encoding", "gzip");
             if (!file.available()) {
-                DEBUG_MSG("File not available\n");
+                DEBUG_MSG("File not available - %s\n", filenameGzip.c_str());
             }
         } else {
             has_set_content_type = true;
             filenameGzip = "/static/index.html.gz";
             file = SPIFFS.open(filenameGzip.c_str());
-            res->setHeader("Content-Encoding", "gzip");
             res->setHeader("Content-Type", "text/html");
+            if (!file.available()) {
+                DEBUG_MSG("File not available - %s\n", filenameGzip.c_str());
+                res->println("Web server is running.<br><br>The content you are looking for can't be found. Please see: <a "
+                             "href=https://meshtastic.org/docs/getting-started/faq#wifi--web-browser>FAQ</a>.<br><br><a "
+                             "href=/json/report>stats</a><br><br><a href=/update>Experemntal Web Content OTA Update</a>");
+            } else {
+                res->setHeader("Content-Encoding", "gzip");
+            }
         }
 
         res->setHeader("Content-Length", httpsserver::intToString(file.size()));
@@ -402,10 +416,6 @@ void handleFormUpload(HTTPRequest *req, HTTPResponse *res)
 
     DEBUG_MSG("Form Upload - Disabling keep-alive\n");
     res->setHeader("Connection", "close");
-
-    DEBUG_MSG("Form Upload - Set frequency to 240mhz\n");
-    // The upload process is very CPU intensive. Let's speed things up a bit.
-    setCpuFrequencyMhz(240);
 
     // First, we need to check the encoding of the form that we have received.
     // The browser will set the Content-Type request header, so we can use it for that purpose.
@@ -560,12 +570,12 @@ void handleReport(HTTPRequest *req, HTTPResponse *res)
 
     res->print("\"tx_log\": [");
 
-    logArray = airtimeReport(TX_LOG);
-    for (int i = 0; i < getPeriodsToLog(); i++) {
+    logArray = airTime->airtimeReport(TX_LOG);
+    for (int i = 0; i < airTime->getPeriodsToLog(); i++) {
         uint32_t tmp;
         tmp = *(logArray + i);
         res->printf("%d", tmp);
-        if (i != getPeriodsToLog() - 1) {
+        if (i != airTime->getPeriodsToLog() - 1) {
             res->print(", ");
         }
     }
@@ -573,12 +583,12 @@ void handleReport(HTTPRequest *req, HTTPResponse *res)
     res->println("],");
     res->print("\"rx_log\": [");
 
-    logArray = airtimeReport(RX_LOG);
-    for (int i = 0; i < getPeriodsToLog(); i++) {
+    logArray = airTime->airtimeReport(RX_LOG);
+    for (int i = 0; i < airTime->getPeriodsToLog(); i++) {
         uint32_t tmp;
         tmp = *(logArray + i);
         res->printf("%d", tmp);
-        if (i != getPeriodsToLog() - 1) {
+        if (i != airTime->getPeriodsToLog() - 1) {
             res->print(", ");
         }
     }
@@ -586,26 +596,25 @@ void handleReport(HTTPRequest *req, HTTPResponse *res)
     res->println("],");
     res->print("\"rx_all_log\": [");
 
-    logArray = airtimeReport(RX_ALL_LOG);
-    for (int i = 0; i < getPeriodsToLog(); i++) {
+    logArray = airTime->airtimeReport(RX_ALL_LOG);
+    for (int i = 0; i < airTime->getPeriodsToLog(); i++) {
         uint32_t tmp;
         tmp = *(logArray + i);
         res->printf("%d", tmp);
-        if (i != getPeriodsToLog() - 1) {
+        if (i != airTime->getPeriodsToLog() - 1) {
             res->print(", ");
         }
     }
 
     res->println("],");
-    res->printf("\"seconds_since_boot\": %u,\n", getSecondsSinceBoot());
-    res->printf("\"seconds_per_period\": %u,\n", getSecondsPerPeriod());
-    res->printf("\"periods_to_log\": %u\n", getPeriodsToLog());
+    res->printf("\"seconds_since_boot\": %u,\n", airTime->getSecondsSinceBoot());
+    res->printf("\"seconds_per_period\": %u,\n", airTime->getSecondsPerPeriod());
+    res->printf("\"periods_to_log\": %u\n", airTime->getPeriodsToLog());
 
     res->println("},");
 
     res->println("\"wifi\": {");
 
-    res->printf("\"web_request_count\": %d,\n", numberOfRequests);
     res->println("\"rssi\": " + String(WiFi.RSSI()) + ",");
 
     if (radioConfig.preferences.wifi_ap_mode || isSoftAPForced()) {
@@ -635,6 +644,7 @@ void handleReport(HTTPRequest *req, HTTPResponse *res)
     res->println("},");
 
     res->println("\"device\": {");
+    res->printf("\"channel_utilization\": %3.2f%,\n", airTime->channelUtilizationPercent());
     res->printf("\"reboot_counter\": %d\n", myNodeInfo.reboot_count);
     res->println("},");
 
@@ -669,6 +679,75 @@ void handleHotspot(HTTPRequest *req, HTTPResponse *res)
 
     // res->println("<!DOCTYPE html>");
     res->println("<meta http-equiv=\"refresh\" content=\"0;url=/\" />\n");
+}
+
+void handleUpdateSPIFFS(HTTPRequest *req, HTTPResponse *res)
+{
+    res->setHeader("Content-Type", "text/html");
+    res->setHeader("Access-Control-Allow-Origin", "*");
+    res->setHeader("Access-Control-Allow-Methods", "GET");
+
+    res->println("Downloading Meshtastic Web Content...");
+
+    File root = SPIFFS.open("/");
+    File file = root.openNextFile();
+
+    DEBUG_MSG("Deleting files from /static\n");
+
+    while (file) {
+        String filePath = String(file.name());
+        if (filePath.indexOf("/static") == 0) {
+            DEBUG_MSG("%s\n", file.name());
+            SPIFFS.remove(file.name());
+        }
+        file = root.openNextFile();
+    }
+
+    // return;
+
+    WiFiClientSecure *client = new WiFiClientSecure;
+    Stream *streamptr = getTarHTTPClientPtr(client, tarURL, certificate);
+
+    if (streamptr != nullptr) {
+
+        TarUnpacker *TARUnpacker = new TarUnpacker();
+        TARUnpacker->haltOnError(false);  // stop on fail (manual restart/reset required)
+        TARUnpacker->setTarVerify(false); // true = enables health checks but slows down the overall process
+        TARUnpacker->setupFSCallbacks(targzTotalBytesFn, targzFreeBytesFn); // prevent the partition from exploding, recommended
+        TARUnpacker->setLoggerCallback(BaseUnpacker::targzPrintLoggerCallback); // gz log verbosity
+        TARUnpacker->setTarProgressCallback(
+            BaseUnpacker::defaultProgressCallback); // prints the untarring progress for each individual file
+        TARUnpacker->setTarStatusProgressCallback(
+            BaseUnpacker::defaultTarStatusProgressCallback);                        // print the filenames as they're expanded
+        TARUnpacker->setTarMessageCallback(BaseUnpacker::targzPrintLoggerCallback); // tar log verbosity
+
+        String contentLengthStr = http.header("Content-Length");
+        contentLengthStr.trim();
+        int64_t streamSize = -1;
+        if (contentLengthStr != "") {
+            streamSize = atoi(contentLengthStr.c_str());
+            Serial.printf("Stream size %d\n", streamSize);
+            res->printf("Stream size %d\n", streamSize);
+        }
+
+        if (!TARUnpacker->tarStreamExpander(streamptr, streamSize, SPIFFS, "/static")) {
+            Serial.printf("tarStreamExpander failed with return code #%d\n", TARUnpacker->tarGzGetError());
+        } else {
+            // print leftover bytes if any (probably zero-fill from the server)
+            while (http.connected()) {
+                size_t streamSize = streamptr->available();
+                if (streamSize) {
+                    Serial.printf("%02x ", streamptr->read());
+                } else
+                    break;
+            }
+        }
+
+    } else {
+        Serial.println("Failed to establish http connection");
+    }
+
+    res->println("<a href=/>Done</a>");
 }
 
 void handleRestart(HTTPRequest *req, HTTPResponse *res)
@@ -736,15 +815,11 @@ void handleScanNetworks(HTTPRequest *req, HTTPResponse *res)
         for (int i = 0; i < n; ++i) {
             char ssidArray[50];
             String ssidString = String(WiFi.SSID(i));
-            // String ssidString = String(WiFi.SSID(i)).toCharArray(ssidArray, WiFi.SSID(i).length());
             ssidString.replace("\"", "\\\"");
             ssidString.toCharArray(ssidArray, 50);
 
             if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) {
-                // res->println("{\"ssid\": \"%s\",\"rssi\": -75}, ", String(WiFi.SSID(i).c_str() );
-
                 res->printf("{\"ssid\": \"%s\",\"rssi\": %d}", ssidArray, WiFi.RSSI(i));
-                // WiFi.RSSI(i)
                 if (i != n - 1) {
                     res->printf(",");
                 }
